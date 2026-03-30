@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.13.9.0] - 2026-03-29 — Sidebar CSS Inspector + Per-Tab Agents
+
+The sidebar is now a visual design tool. Pick any element on the page and see the full CSS rule cascade, box model, and computed styles right in the Side Panel. Edit styles live and see changes instantly. Each browser tab gets its own independent agent, so you can work on multiple pages simultaneously without cross-talk.
+
+### Added
+
+- **CSS Inspector in the sidebar.** Click "Pick Element", hover over anything, click it, and the sidebar shows the full CSS rule cascade with specificity badges, source file:line, box model visualization (gstack palette colors), and computed styles. Like Chrome DevTools, but inside the sidebar.
+- **Live style editing.** `$B style .selector property value` modifies CSS rules in real time via CDP. Changes show instantly on the page. Undo with `$B style --undo`.
+- **Per-tab agents.** Each browser tab gets its own Claude agent process. Switch tabs in the browser and the sidebar swaps to that tab's chat history. Ask questions about different pages in parallel without agents fighting over which tab is active.
+- **Tab tracking.** User-created tabs (Cmd+T, right-click "Open in new tab") are automatically tracked. The sidebar tab bar updates in real time. Click a tab in the sidebar to switch the browser. Close a tab and it disappears from the bar.
+- **Page cleanup.** `$B cleanup --all` removes ads, cookie banners, sticky headers, and social widgets for clean screenshots.
+- **Pretty screenshots.** `$B prettyscreenshot --cleanup --scroll-to ".pricing" ~/Desktop/hero.png` combines cleanup, scroll positioning, and screenshot in one command.
+- **Stop button.** A red stop button appears in the sidebar when an agent is working. Click it to cancel the current task.
+
+### Changed
+
+- **Sidebar banner** now says "Browser co-pilot" instead of the old mode-specific text.
+- **Input placeholder** is "Ask about this page..." (more inviting than the old placeholder).
+- **System prompt** includes prompt injection defense and allowed-commands whitelist from the security audit.
+
 ## [0.13.8.0] - 2026-03-29 — Security Audit Round 2
 
 Browse output is now wrapped in trust boundary markers so agents can tell page content from tool output. Markers are escape-proof. The Chrome extension validates message senders. CDP binds to localhost only. Bun installs use checksum verification.
