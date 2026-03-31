@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.14.4.0] - 2026-03-31 — GStack Browser: Double-Click AI Browser
+
+GStack Browser is a macOS .app you can double-click to launch an AI-controlled browser. Chromium opens with the sidebar baked in, Claude Code ready to go. No terminal needed. Sites like Google and NYTimes work without captchas because the browser now has anti-bot stealth patches. The menu bar says "GStack Browser" instead of "Google Chrome for Testing."
+
+### Added
+
+- **GStack Browser.app.** `scripts/build-app.sh` creates a self-contained .app bundle (389MB, 189MB DMG). Bundles the compiled browse binary, Playwright's Chromium, and the sidebar extension. Launches in ~5 seconds on Apple Silicon.
+- **Dev mode launcher.** `scripts/app/gstack-browser` works in two modes: inside the .app bundle (uses bundled resources) or dev mode (uses your global gstack install). Same script, zero config.
+- **Anti-bot stealth.** `navigator.webdriver` is now `false`. Fake plugins array (3 entries, like real Chrome). Proper `navigator.languages`. CDP artifact cleanup. Permissions API returns `prompt` not `denied`. Sites that blocked "Chrome for Testing" now work normally.
+- **Custom user agent.** `Chrome/<version> Safari/537.36 GStackBrowser`. Auto-detects Chrome version from the binary. No more "Chrome for Testing" in the UA string.
+- **Chromium rebranding.** Menu bar, Dock, and Cmd+Tab all show "GStack Browser" instead of "Google Chrome for Testing". Patched at launch time (dev mode) and build time (.app bundle).
+- **Auth via /health.** Extension reads auth token from the browse server's `/health` endpoint instead of `.auth.json` file. Fixes codesigning and read-only .app bundle issues.
+- **GSTACK_CHROMIUM_PATH env var.** Point Playwright at any Chromium binary. Used by the .app launcher.
+- **BROWSE_EXTENSIONS_DIR env var.** Override extension path. Used by the .app bundle.
+- **GStack Browser V0 design doc.** `docs/designs/GSTACK_BROWSER_V0.md` covers the full 5-phase roadmap, 9 capability visions, Chromium fork trigger criteria, competitive landscape, and architecture.
+
+### Changed
+
+- **Extension auth bootstrap.** `background.js` now reads token from `/health` instead of `chrome.runtime.getURL('.auth.json')`. Simpler, works everywhere.
+- **Security test updated.** `server-auth.test.ts` updated to verify token IS present in `/health` (localhost-only, safe) instead of verifying it was removed.
+
 ## [0.14.3.0] - 2026-03-31 — Always-On Adversarial Review + Scope Drift + Plan Mode Design Tools
 
 Every code review now runs adversarial analysis from both Claude and Codex, regardless of diff size. A 5-line auth change gets the same cross-model scrutiny as a 500-line feature. The old "skip adversarial for small diffs" heuristic is gone... diff size was never a good proxy for risk.
