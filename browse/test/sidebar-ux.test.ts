@@ -1385,3 +1385,42 @@ describe('sidebar debug visibility when stuck', () => {
     expect(spSrc).toContain('reconnectAttempts');
   });
 });
+
+describe('BROWSE_NO_AUTOSTART (sidebar headless prevention)', () => {
+  const cliSrc = fs.readFileSync(path.join(ROOT, 'src', 'cli.ts'), 'utf-8');
+  const agentSrc = fs.readFileSync(path.join(ROOT, 'src', 'sidebar-agent.ts'), 'utf-8');
+
+  test('cli.ts checks BROWSE_NO_AUTOSTART before starting a new server', () => {
+    // ensureServer must check this env var BEFORE calling startServer()
+    const ensureServerFn = cliSrc.slice(
+      cliSrc.indexOf('async function ensureServer()'),
+      cliSrc.indexOf('async function startServer()'),
+    );
+    expect(ensureServerFn).toContain('BROWSE_NO_AUTOSTART');
+    expect(ensureServerFn).toContain('process.exit(1)');
+  });
+
+  test('cli.ts shows actionable error message when BROWSE_NO_AUTOSTART blocks', () => {
+    expect(cliSrc).toContain('/open-gstack-browser');
+    expect(cliSrc).toContain('BROWSE_NO_AUTOSTART is set');
+  });
+
+  test('sidebar-agent.ts sets BROWSE_NO_AUTOSTART=1', () => {
+    expect(agentSrc).toContain("BROWSE_NO_AUTOSTART: '1'");
+  });
+
+  test('sidebar-agent.ts sets BROWSE_PORT for headed server reuse', () => {
+    expect(agentSrc).toContain('BROWSE_PORT');
+  });
+
+  test('BROWSE_NO_AUTOSTART check happens before lock acquisition', () => {
+    // The guard must be BEFORE the lock acquisition. If it's after,
+    // we'd acquire a lock and then exit, leaving a stale lock file.
+    const ensureServerStart = cliSrc.indexOf('async function ensureServer()');
+    const noAutoStart = cliSrc.indexOf('BROWSE_NO_AUTOSTART', ensureServerStart);
+    const lockAcquisition = cliSrc.indexOf('Acquire lock', ensureServerStart);
+    expect(noAutoStart).toBeGreaterThan(0);
+    expect(lockAcquisition).toBeGreaterThan(0);
+    expect(noAutoStart).toBeLessThan(lockAcquisition);
+  });
+});
