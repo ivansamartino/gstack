@@ -20,6 +20,10 @@ import { handleMetaCommand } from './meta-commands';
 import { handleCookiePickerRoute } from './cookie-picker-routes';
 import { sanitizeExtensionUrl } from './sidebar-utils';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, wrapUntrustedContent } from './commands';
+import {
+  wrapUntrustedPageContent, datamarkContent,
+  runContentFilters, type ContentFilterResult,
+} from './content-security';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
 import {
   initRegistry, validateToken as validateScopedToken, checkScope, checkDomain,
@@ -954,11 +958,6 @@ async function handleCommandInternal(
 
     if (READ_COMMANDS.has(command)) {
       result = await handleReadCommand(command, args, browserManager);
-      // Content wrapping for page-content commands (scoped vs root handled here)
-      // Chain subcommands: each gets wrapped individually here. Chain result is NOT re-wrapped.
-      if (PAGE_CONTENT_COMMANDS.has(command)) {
-        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
-      }
     } else if (WRITE_COMMANDS.has(command)) {
       result = await handleWriteCommand(command, args, browserManager);
     } else if (META_COMMANDS.has(command)) {
@@ -1000,6 +999,35 @@ async function handleCommandInternal(
           hint: `Available commands: ${[...READ_COMMANDS, ...WRITE_COMMANDS, ...META_COMMANDS].sort().join(', ')}`,
         }),
       };
+    }
+
+    // ─── Centralized content wrapping (single location for all commands) ───
+    // Scoped tokens: content filter + enhanced envelope + datamarking
+    // Root tokens: basic untrusted content wrapper (backward compat)
+    // Chain exempt from top-level wrapping (each subcommand wrapped individually)
+    if (PAGE_CONTENT_COMMANDS.has(command) && command !== 'chain') {
+      const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
+      if (isScoped) {
+        // Run content filters
+        const filterResult: ContentFilterResult = runContentFilters(
+          result, browserManager.getCurrentUrl(), command,
+        );
+        if (filterResult.blocked) {
+          return { status: 403, json: true, result: JSON.stringify({ error: filterResult.message }) };
+        }
+        // Datamark text command output only (not html, forms, or structured data)
+        if (command === 'text') {
+          result = datamarkContent(result);
+        }
+        // Enhanced envelope wrapping for scoped tokens
+        result = wrapUntrustedPageContent(
+          result, command,
+          filterResult.warnings.length > 0 ? filterResult.warnings : undefined,
+        );
+      } else {
+        // Root token: basic wrapping (backward compat, Decision 2)
+        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
+      }
     }
 
     // Activity: emit command_end (skipped for chain subcommands)
