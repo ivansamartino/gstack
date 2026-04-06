@@ -440,13 +440,11 @@ describe('Dropdown/popover detection', () => {
     const snap = await handleMetaCommand('snapshot', ['-i'], bm, shutdown);
     // Find a @c ref for Alice
     const aliceLine = snap.split('\n').find(l => l.includes('@c') && l.includes('Alice'));
-    if (aliceLine) {
-      const refMatch = aliceLine.match(/@(c\d+)/);
-      if (refMatch) {
-        const result = await handleWriteCommand('click', [`@${refMatch[1]}`], bm);
-        expect(result).toContain('Clicked');
-      }
-    }
+    expect(aliceLine).toBeTruthy();
+    const refMatch = aliceLine!.match(/@(c\d+)/);
+    expect(refMatch).toBeTruthy();
+    const result = await handleWriteCommand('click', [`@${refMatch![1]}`], bm);
+    expect(result).toContain('Clicked');
   });
 
   test('snapshot -C still works standalone without -i', async () => {
