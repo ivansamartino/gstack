@@ -8,47 +8,15 @@ import { getCleanText } from './read-commands';
 import { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS, PAGE_CONTENT_COMMANDS, wrapUntrustedContent } from './commands';
 import { validateNavigationUrl } from './url-validation';
 import { checkScope, type TokenInfo } from './token-registry';
+import { validateOutputPath, escapeRegExp } from './path-security';
+// Re-export for backward compatibility (tests import from meta-commands)
+export { validateOutputPath, escapeRegExp } from './path-security';
 import * as Diff from 'diff';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TEMP_DIR, isPathWithin } from './platform';
+import { TEMP_DIR } from './platform';
 import { resolveConfig } from './config';
 import type { Frame } from 'playwright';
-
-// Security: Path validation to prevent path traversal attacks
-// Resolve safe directories through realpathSync to handle symlinks (e.g., macOS /tmp → /private/tmp)
-const SAFE_DIRECTORIES = [TEMP_DIR, process.cwd()].map(d => {
-  try { return fs.realpathSync(d); } catch { return d; }
-});
-
-export function validateOutputPath(filePath: string): void {
-  const resolved = path.resolve(filePath);
-
-  // Resolve real path of the parent directory to catch symlinks.
-  // The file itself may not exist yet (e.g., screenshot output).
-  let dir = path.dirname(resolved);
-  let realDir: string;
-  try {
-    realDir = fs.realpathSync(dir);
-  } catch {
-    try {
-      realDir = fs.realpathSync(path.dirname(dir));
-    } catch {
-      throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-    }
-  }
-
-  const realResolved = path.join(realDir, path.basename(resolved));
-  const isSafe = SAFE_DIRECTORIES.some(dir => isPathWithin(realResolved, dir));
-  if (!isSafe) {
-    throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-  }
-}
-
-/** Escape special regex metacharacters in a user-supplied string to prevent ReDoS. */
-export function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 /** Tokenize a pipe segment respecting double-quoted strings. */
 function tokenizePipeSegment(segment: string): string[] {

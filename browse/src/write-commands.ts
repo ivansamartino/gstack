@@ -8,53 +8,11 @@
 import type { BrowserManager } from './browser-manager';
 import { findInstalledBrowsers, importCookies, listSupportedBrowserNames } from './cookie-import-browser';
 import { validateNavigationUrl } from './url-validation';
+import { validateOutputPath } from './path-security';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TEMP_DIR, isPathWithin } from './platform';
+import { TEMP_DIR } from './platform';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
-
-// Security: Path validation for screenshot output
-// Resolve safe directories through realpathSync to handle symlinks (e.g., macOS /tmp -> /private/tmp)
-const SAFE_DIRECTORIES = [TEMP_DIR, process.cwd()].map(d => {
-  try { return fs.realpathSync(d); } catch { return d; }
-});
-
-function validateOutputPath(filePath: string): void {
-  const resolved = path.resolve(filePath);
-
-  // Basic containment check using lexical resolution only.
-  // This catches obvious traversal (../../../etc/passwd) but NOT symlinks.
-  const isSafe = SAFE_DIRECTORIES.some(dir => isPathWithin(resolved, dir));
-  if (!isSafe) {
-    throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-  }
-
-  // Symlink check: resolve the real path of the nearest existing ancestor
-  // directory and re-validate. This closes the symlink bypass where a
-  // symlink inside /tmp or cwd points outside the safe zone.
-  //
-  // We resolve the parent dir (not the file itself — it may not exist yet).
-  // If the parent doesn't exist either we fall back up the tree.
-  let dir = path.dirname(resolved);
-  let realDir: string;
-  try {
-    realDir = fs.realpathSync(dir);
-  } catch {
-    // Parent doesn't exist — check the grandparent, or skip if inaccessible
-    try {
-      realDir = fs.realpathSync(path.dirname(dir));
-    } catch {
-      // Can't resolve — fail safe
-      throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-    }
-  }
-
-  const realResolved = path.join(realDir, path.basename(resolved));
-  const isRealSafe = SAFE_DIRECTORIES.some(dir => isPathWithin(realResolved, dir));
-  if (!isRealSafe) {
-    throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')} (symlink target blocked)`);
-  }
-}
 
 /**
  * Aggressive page cleanup selectors and heuristics.
