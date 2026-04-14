@@ -463,7 +463,7 @@ async function getMacKeychainPassword(service: string): Promise<string> {
     setTimeout(() => {
       proc.kill();
       reject(new CookieImportError(
-        `macOS is waiting for Keychain permission. Look for a dialog asking to allow access to "${service}".`,
+        `macOS Keychain permission timed out for "${service}". Check the top-right of your screen for a system dialog asking to allow Keychain access. If no dialog appeared, open Keychain Access.app and check if "${service}" exists. Click Retry after allowing access.`,
         'keychain_timeout',
         'retry',
       ));
@@ -480,7 +480,7 @@ async function getMacKeychainPassword(service: string): Promise<string> {
       const errText = stderr.trim().toLowerCase();
       if (errText.includes('user canceled') || errText.includes('denied') || errText.includes('interaction not allowed')) {
         throw new CookieImportError(
-          `Keychain access denied. Click "Allow" in the macOS dialog for "${service}".`,
+          `Keychain access denied for "${service}". A macOS dialog should have appeared asking to allow access — click "Always Allow" to avoid this in the future. If you dismissed it, click Retry to trigger it again.`,
           'keychain_denied',
           'retry',
         );

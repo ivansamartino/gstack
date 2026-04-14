@@ -1170,6 +1170,28 @@ async function shutdown() {
   clearInterval(idleCheckInterval);
   await flushBuffers(); // Final flush (async now)
 
+  // Auto-save cookies so they persist across server restarts
+  try {
+    const state = await browserManager.saveState();
+    if (state.cookies.length > 0) {
+      const autoStateDir = path.join(config.stateDir, 'browse-states');
+      fs.mkdirSync(autoStateDir, { recursive: true });
+      const autoStatePath = path.join(autoStateDir, '_auto.json');
+      const saveData = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        cookies: state.cookies,
+        pages: state.pages
+          .filter(p => p.url && p.url !== 'about:blank')
+          .map(p => ({ url: p.url, isActive: p.isActive })),
+      };
+      fs.writeFileSync(autoStatePath, JSON.stringify(saveData, null, 2), { mode: 0o600 });
+      console.log(`[browse] Auto-saved ${state.cookies.length} cookies for next session`);
+    }
+  } catch (err: any) {
+    console.debug('[browse] Auto-save cookies failed:', err.message);
+  }
+
   await browserManager.close();
 
   // Clean up Chromium profile locks (prevent SingletonLock on next launch)
@@ -1260,6 +1282,37 @@ async function start() {
       console.log(`[browse] Launched headed Chromium with extension`);
     } else {
       await browserManager.launch();
+    }
+
+    // Auto-restore cookies from previous session (if any)
+    try {
+      const autoStatePath = path.join(config.stateDir, 'browse-states', '_auto.json');
+      if (fs.existsSync(autoStatePath)) {
+        const data = JSON.parse(fs.readFileSync(autoStatePath, 'utf-8'));
+        if (Array.isArray(data.cookies) && data.cookies.length > 0) {
+          // Filter out expired and invalid cookies
+          const now = Date.now() / 1000;
+          const validCookies = data.cookies.filter((c: any) => {
+            if (typeof c !== 'object' || !c) return false;
+            if (typeof c.name !== 'string' || typeof c.value !== 'string') return false;
+            if (typeof c.domain !== 'string' || !c.domain) return false;
+            // Skip expired cookies
+            if (c.expires && c.expires > 0 && c.expires < now) return false;
+            // Skip internal-network cookies
+            const d = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+            if (d === 'localhost' || d.endsWith('.internal') || d === '169.254.169.254') return false;
+            return true;
+          });
+          if (validCookies.length > 0) {
+            await browserManager.addCookies(validCookies);
+            console.log(`[browse] Auto-restored ${validCookies.length} cookies from previous session`);
+          }
+        }
+        // Delete the auto-save file after restoring (one-shot)
+        fs.unlinkSync(autoStatePath);
+      }
+    } catch (err: any) {
+      console.debug('[browse] Auto-restore cookies failed:', err.message);
     }
   }
 

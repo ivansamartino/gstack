@@ -13,7 +13,8 @@ import { validateNavigationUrl } from './url-validation';
 import { validateOutputPath } from './path-security';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TEMP_DIR } from './platform';
+import { TEMP_DIR, isPathWithin } from './platform';
+import { SAFE_DIRECTORIES } from './path-security';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
 
 /**
@@ -353,17 +354,50 @@ export async function handleWriteCommand(
 
     case 'cookie': {
       const cookieStr = args[0];
-      if (!cookieStr || !cookieStr.includes('=')) throw new Error('Usage: browse cookie <name>=<value>');
+      if (!cookieStr || !cookieStr.includes('=')) throw new Error('Usage: browse cookie <name>=<value> [--domain d] [--path p] [--secure] [--httponly] [--samesite none|lax|strict]');
       const eq = cookieStr.indexOf('=');
       const name = cookieStr.slice(0, eq);
       const value = cookieStr.slice(eq + 1);
       const url = new URL(page.url());
-      await page.context().addCookies([{
-        name,
-        value,
-        domain: url.hostname,
-        path: '/',
-      }]);
+
+      // Parse optional flags from remaining args
+      let domain = url.hostname;
+      let cookiePath = '/';
+      let secure: boolean | undefined;
+      let httpOnly: boolean | undefined;
+      let sameSite: 'Strict' | 'Lax' | 'None' | undefined;
+
+      for (let i = 1; i < args.length; i++) {
+        const flag = args[i];
+        if (flag === '--domain' && args[i + 1]) {
+          domain = args[++i];
+          // Validate domain matches current page
+          const cleanDomain = domain.startsWith('.') ? domain.slice(1) : domain;
+          const pageHost = url.hostname;
+          if (cleanDomain !== pageHost && !pageHost.endsWith('.' + cleanDomain)) {
+            throw new Error(`Cookie domain "${domain}" does not match current page "${pageHost}". Navigate to the target site first.`);
+          }
+        } else if (flag === '--path' && args[i + 1]) {
+          cookiePath = args[++i];
+        } else if (flag === '--secure') {
+          secure = true;
+        } else if (flag === '--httponly') {
+          httpOnly = true;
+        } else if (flag === '--samesite' && args[i + 1]) {
+          const val = args[++i].toLowerCase();
+          if (val === 'none') sameSite = 'None';
+          else if (val === 'lax') sameSite = 'Lax';
+          else if (val === 'strict') sameSite = 'Strict';
+          else throw new Error(`Invalid sameSite value: "${val}". Use none, lax, or strict.`);
+        }
+      }
+
+      const cookie: Record<string, any> = { name, value, domain, path: cookiePath };
+      if (secure !== undefined) cookie.secure = secure;
+      if (httpOnly !== undefined) cookie.httpOnly = httpOnly;
+      if (sameSite !== undefined) cookie.sameSite = sameSite;
+
+      await page.context().addCookies([cookie]);
       return `Cookie set: ${name}=****`;
     }
 

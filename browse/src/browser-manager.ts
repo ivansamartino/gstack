@@ -781,6 +781,16 @@ export class BrowserManager {
   }
 
   // ─── State Save/Restore (shared by recreateContext + handoff) ─
+
+  /**
+   * Add cookies to the current browser context without affecting pages or tabs.
+   * Used by auto-restore on server startup to persist cookies across restarts.
+   */
+  async addCookies(cookies: Array<{ name: string; value: string; domain: string; path: string; [k: string]: any }>): Promise<void> {
+    if (!this.context) throw new Error('Browser not launched');
+    await this.context.addCookies(cookies);
+  }
+
   /**
    * Capture browser state: cookies, localStorage, sessionStorage, URLs, active tab.
    * Skips pages that fail storage reads (e.g., already closed).
