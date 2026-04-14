@@ -35,9 +35,11 @@ import {
 import { validateTempPath } from './path-security';
 import { resolveConfig, ensureStateDir, readVersionHash } from './config';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
+import { initAuditLog, writeAuditEntry } from './audit';
 import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
 // Bun.spawn used instead of child_process.spawn (compiled bun binaries
 // fail posix_spawn on all executables including /bin/bash)
+import { safeUnlink, safeUnlinkQuiet, safeKill } from './error-handling';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
@@ -46,6 +48,7 @@ import * as crypto from 'crypto';
 // ─── Config ─────────────────────────────────────────────────────
 const config = resolveConfig();
 ensureStateDir(config);
+initAuditLog(config.auditLog);
 
 // ─── Auth ───────────────────────────────────────────────────────
 const AUTH_TOKEN = crypto.randomUUID();
@@ -233,7 +236,9 @@ function findBrowseBin(): string {
     path.join(process.env.HOME || '', '.claude', 'skills', 'gstack', 'browse', 'dist', 'browse'),
   ];
   for (const c of candidates) {
-    try { if (fs.existsSync(c)) return c; } catch {}
+    try { if (fs.existsSync(c)) return c; } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
   }
   return 'browse'; // fallback to PATH
 }
@@ -265,13 +270,17 @@ function findClaudeBin(): string | null {
       const p = proc.stdout.toString().trim();
       if (p) candidates.unshift(p);
     }
-  } catch {}
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
   for (const c of candidates) {
     try {
       if (!fs.existsSync(c)) continue;
       // Resolve symlinks — posix_spawn can fail on symlinks in compiled bun binaries
       return fs.realpathSync(c);
-    } catch {}
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
   }
   return null;
 }
@@ -465,8 +474,8 @@ function listSessions(): Array<SidebarSession & { chatLines: number }> {
       try {
         const session = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, d, 'session.json'), 'utf-8'));
         let chatLines = 0;
-        try { chatLines = fs.readFileSync(path.join(SESSIONS_DIR, d, 'chat.jsonl'), 'utf-8').split('\n').filter(Boolean).length; } catch {
-          // Expected: no chat file yet
+        try { chatLines = fs.readFileSync(path.join(SESSIONS_DIR, d, 'chat.jsonl'), 'utf-8').split('\n').filter(Boolean).length; } catch (err: any) {
+          if (err?.code !== 'ENOENT') throw err;
         }
         return { ...session, chatLines };
       } catch { return null; }
@@ -602,7 +611,9 @@ function spawnClaude(userMessage: string, extensionUrl?: string | null, forTabId
   try {
     fs.mkdirSync(gstackDir, { recursive: true, mode: 0o700 });
     fs.appendFileSync(agentQueue, entry + '\n');
-    try { fs.chmodSync(agentQueue, 0o600); } catch {}
+    try { fs.chmodSync(agentQueue, 0o600); } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
   } catch (err: any) {
     addChatEntry({ ts: new Date().toISOString(), role: 'agent', type: 'agent_error', error: `Failed to queue: ${err.message}` });
     agentStatus = 'idle';
@@ -617,12 +628,11 @@ function spawnClaude(userMessage: string, extensionUrl?: string | null, forTabId
 
 function killAgent(targetTabId?: number | null): void {
   if (agentProcess) {
-    try { agentProcess.kill('SIGTERM'); } catch (err: any) {
-      console.warn('[browse] Failed to SIGTERM agent:', err.message);
+    const pid = agentProcess.pid;
+    if (pid) {
+      safeKill(pid, 'SIGTERM');
+      setTimeout(() => { safeKill(pid, 'SIGKILL'); }, 3000);
     }
-    setTimeout(() => { try { agentProcess?.kill('SIGKILL'); } catch (err: any) {
-      console.warn('[browse] Failed to SIGKILL agent:', err.message);
-    } }, 3000);
   }
   // Signal the sidebar-agent worker to cancel via a per-tab cancel file.
   // Using per-tab files prevents race conditions where one agent's cancel
@@ -631,7 +641,12 @@ function killAgent(targetTabId?: number | null): void {
   const cancelDir = path.join(process.env.HOME || '/tmp', '.gstack');
   const tabId = targetTabId ?? agentTabId ?? 0;
   const cancelFile = path.join(cancelDir, `sidebar-agent-cancel-${tabId}`);
-  try { fs.writeFileSync(cancelFile, Date.now().toString()); } catch {}
+  try {
+    fs.mkdirSync(cancelDir, { recursive: true });
+    fs.writeFileSync(cancelFile, Date.now().toString());
+  } catch (err: any) {
+    if (err?.code !== 'EACCES' && err?.code !== 'ENOENT') throw err;
+  }
   agentProcess = null;
   agentStartTime = null;
   currentMessage = null;
@@ -1000,7 +1015,7 @@ async function handleCommandInternal(
           await cleanupHiddenMarkers(page);
         }
       } else {
-        result = await handleReadCommand(command, args, session);
+        result = await handleReadCommand(command, args, session, browserManager);
       }
     } else if (WRITE_COMMANDS.has(command)) {
       result = await handleWriteCommand(command, args, session, browserManager);
@@ -1075,13 +1090,14 @@ async function handleCommandInternal(
     }
 
     // Activity: emit command_end (skipped for chain subcommands)
+    const successDuration = Date.now() - startTime;
     if (!opts?.skipActivity) {
       emitActivity({
         type: 'command_end',
         command,
         args,
         url: browserManager.getCurrentUrl(),
-        duration: Date.now() - startTime,
+        duration: successDuration,
         status: 'ok',
         result: result,
         tabs: browserManager.getTabCount(),
@@ -1089,6 +1105,17 @@ async function handleCommandInternal(
         clientId: tokenInfo?.clientId,
       });
     }
+
+    writeAuditEntry({
+      ts: new Date().toISOString(),
+      cmd: command,
+      args: args.join(' '),
+      origin: browserManager.getCurrentUrl(),
+      durationMs: successDuration,
+      status: 'ok',
+      hasCookies: browserManager.hasCookieImports(),
+      mode: browserManager.getConnectionMode(),
+    });
 
     browserManager.resetFailures();
     // Restore original active tab if we pinned to a specific one
@@ -1107,13 +1134,14 @@ async function handleCommandInternal(
     }
 
     // Activity: emit command_end (error) — skipped for chain subcommands
+    const errorDuration = Date.now() - startTime;
     if (!opts?.skipActivity) {
       emitActivity({
         type: 'command_end',
         command,
         args,
         url: browserManager.getCurrentUrl(),
-        duration: Date.now() - startTime,
+        duration: errorDuration,
         status: 'error',
         error: err.message,
         tabs: browserManager.getTabCount(),
@@ -1121,6 +1149,18 @@ async function handleCommandInternal(
         clientId: tokenInfo?.clientId,
       });
     }
+
+    writeAuditEntry({
+      ts: new Date().toISOString(),
+      cmd: command,
+      args: args.join(' '),
+      origin: browserManager.getCurrentUrl(),
+      durationMs: errorDuration,
+      status: 'error',
+      error: err.message,
+      hasCookies: browserManager.hasCookieImports(),
+      mode: browserManager.getConnectionMode(),
+    });
 
     browserManager.incrementFailures();
     let errorMsg = wrapError(err);
@@ -1197,15 +1237,11 @@ async function shutdown() {
   // Clean up Chromium profile locks (prevent SingletonLock on next launch)
   const profileDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
   for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    try { fs.unlinkSync(path.join(profileDir, lockFile)); } catch (err: any) {
-      console.debug('[browse] Lock cleanup:', lockFile, err.message);
-    }
+    safeUnlinkQuiet(path.join(profileDir, lockFile));
   }
 
   // Clean up state file
-  try { fs.unlinkSync(config.stateFile); } catch (err: any) {
-    console.debug('[browse] State file cleanup:', err.message);
-  }
+  safeUnlinkQuiet(config.stateFile);
 
   process.exit(0);
 }
@@ -1217,9 +1253,7 @@ process.on('SIGINT', shutdown);
 // Defense-in-depth — primary cleanup is the CLI's stale-state detection via health check.
 if (process.platform === 'win32') {
   process.on('exit', () => {
-    try { fs.unlinkSync(config.stateFile); } catch {
-      // Best-effort on exit
-    }
+    safeUnlinkQuiet(config.stateFile);
   });
 }
 
@@ -1238,13 +1272,9 @@ function emergencyCleanup() {
   // Clean Chromium profile locks
   const profileDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
   for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    try { fs.unlinkSync(path.join(profileDir, lockFile)); } catch (err: any) {
-      console.debug('[browse] Emergency lock cleanup:', lockFile, err.message);
-    }
+    safeUnlinkQuiet(path.join(profileDir, lockFile));
   }
-  try { fs.unlinkSync(config.stateFile); } catch (err: any) {
-    console.debug('[browse] Emergency state cleanup:', err.message);
-  }
+  safeUnlinkQuiet(config.stateFile);
 }
 process.on('uncaughtException', (err) => {
   console.error('[browse] FATAL uncaught exception:', err.message);
@@ -1260,15 +1290,9 @@ process.on('unhandledRejection', (err: any) => {
 // ─── Start ─────────────────────────────────────────────────────
 async function start() {
   // Clear old log files
-  try { fs.unlinkSync(CONSOLE_LOG_PATH); } catch (err: any) {
-    if (err.code !== 'ENOENT') console.debug('[browse] Log cleanup console:', err.message);
-  }
-  try { fs.unlinkSync(NETWORK_LOG_PATH); } catch (err: any) {
-    if (err.code !== 'ENOENT') console.debug('[browse] Log cleanup network:', err.message);
-  }
-  try { fs.unlinkSync(DIALOG_LOG_PATH); } catch (err: any) {
-    if (err.code !== 'ENOENT') console.debug('[browse] Log cleanup dialog:', err.message);
-  }
+  safeUnlink(CONSOLE_LOG_PATH);
+  safeUnlink(NETWORK_LOG_PATH);
+  safeUnlink(DIALOG_LOG_PATH);
 
   const port = await findPort();
 
@@ -1335,15 +1359,11 @@ async function start() {
           const slug = process.env.GSTACK_SLUG || 'unknown';
           const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
           const projectWelcome = `${homeDir}/.gstack/projects/${slug}/designs/welcome-page-20260331/finalized.html`;
-          try { if (require('fs').existsSync(projectWelcome)) return projectWelcome; } catch (err: any) {
-            console.warn('[browse] Error checking project welcome page:', err.message);
-          }
+          if (fs.existsSync(projectWelcome)) return projectWelcome;
           // Fallback: built-in welcome page from gstack install
           const skillRoot = process.env.GSTACK_SKILL_ROOT || `${homeDir}/.claude/skills/gstack`;
           const builtinWelcome = `${skillRoot}/browse/src/welcome.html`;
-          try { if (require('fs').existsSync(builtinWelcome)) return builtinWelcome; } catch (err: any) {
-            console.warn('[browse] Error checking builtin welcome page:', err.message);
-          }
+          if (fs.existsSync(builtinWelcome)) return builtinWelcome;
           return null;
         })();
         if (welcomePath) {
@@ -1867,8 +1887,9 @@ async function start() {
         chatBuffer = [];
         chatNextId = 0;
         if (sidebarSession) {
-          try { fs.writeFileSync(path.join(SESSIONS_DIR, sidebarSession.id, 'chat.jsonl'), '', { mode: 0o600 }); } catch (err: any) {
-            console.error('[browse] Failed to clear chat file:', err.message);
+          const chatFile = path.join(SESSIONS_DIR, sidebarSession.id, 'chat.jsonl');
+          try { fs.writeFileSync(chatFile, '', { mode: 0o600 }); } catch (err: any) {
+            if (err?.code !== 'ENOENT') console.error('[browse] Failed to clear chat file:', err.message);
           }
         }
         return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });

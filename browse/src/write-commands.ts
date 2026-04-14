@@ -433,7 +433,7 @@ export async function handleWriteCommand(
         if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
         if (path.isAbsolute(fp)) {
           let resolvedFp: string;
-          try { resolvedFp = fs.realpathSync(path.resolve(fp)); } catch { resolvedFp = path.resolve(fp); }
+          try { resolvedFp = fs.realpathSync(path.resolve(fp)); } catch (err: any) { if (err?.code !== 'ENOENT') throw err; resolvedFp = path.resolve(fp); }
           if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedFp, dir))) {
             throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
           }
@@ -475,21 +475,22 @@ export async function handleWriteCommand(
     case 'cookie-import': {
       const filePath = args[0];
       if (!filePath) throw new Error('Usage: browse cookie-import <json-file>');
-      // Path validation — prevent reading arbitrary files
-      if (path.isAbsolute(filePath)) {
-        const safeDirs = [TEMP_DIR, process.cwd()];
-        const resolved = path.resolve(filePath);
-        if (!safeDirs.some(dir => isPathWithin(resolved, dir))) {
-          throw new Error(`Path must be within: ${safeDirs.join(', ')}`);
-        }
+      // Path validation — resolve to absolute and check against safe dirs.
+      // Fixes #707: relative paths previously bypassed the safe directory check.
+      // Mirrors validateOutputPath() — resolves symlinks (e.g., macOS /tmp → /private/tmp).
+      const resolved = path.resolve(filePath);
+      let resolvedReal = resolved;
+      try { resolvedReal = fs.realpathSync(resolved); } catch {
+        // File may not exist yet — resolve parent dir instead
+        try { resolvedReal = path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved)); } catch {}
       }
-      if (path.normalize(filePath).includes('..')) {
-        throw new Error('Path traversal sequences (..) are not allowed');
+      if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedReal, dir))) {
+        throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
       }
       if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
       const raw = fs.readFileSync(filePath, 'utf-8');
       let cookies: any[];
-      try { cookies = JSON.parse(raw); } catch { throw new Error(`Invalid JSON in ${filePath}`); }
+      try { cookies = JSON.parse(raw); } catch (err: any) { throw new Error(`Invalid JSON in ${filePath}: ${err?.message || err}`); }
       if (!Array.isArray(cookies)) throw new Error('Cookie file must contain a JSON array');
 
       // Auto-fill domain from current page URL when missing (consistent with cookie command)
@@ -510,20 +511,24 @@ export async function handleWriteCommand(
       }
 
       await page.context().addCookies(cookies);
+      const importedDomains = [...new Set(cookies.map((c: any) => c.domain).filter(Boolean))];
+      if (importedDomains.length > 0) bm.trackCookieImportDomains(importedDomains);
       return `Loaded ${cookies.length} cookies from ${filePath}`;
     }
 
     case 'cookie-import-browser': {
       // Two modes:
       // 1. Direct CLI import: cookie-import-browser <browser> --domain <domain> [--profile <profile>]
-      // 2. Open picker UI: cookie-import-browser [browser]
+      //    Requires --domain (or --all to explicitly import everything).
+      // 2. Open picker UI: cookie-import-browser [browser] (interactive domain selection)
       const browserArg = args[0];
       const domainIdx = args.indexOf('--domain');
       const profileIdx = args.indexOf('--profile');
+      const hasAll = args.includes('--all');
       const profile = (profileIdx !== -1 && profileIdx + 1 < args.length) ? args[profileIdx + 1] : 'Default';
 
       if (domainIdx !== -1 && domainIdx + 1 < args.length) {
-        // Direct import mode — no UI
+        // Direct import mode — scoped to specific domain
         const domain = args[domainIdx + 1];
         // Validate --domain against current page hostname to prevent cross-site cookie injection
         const pageHostname = new URL(page.url()).hostname;
@@ -535,13 +540,35 @@ export async function handleWriteCommand(
         const result = await importCookies(browser, [domain], profile);
         if (result.cookies.length > 0) {
           await page.context().addCookies(result.cookies);
+          bm.trackCookieImportDomains([domain]);
         }
         const msg = [`Imported ${result.count} cookies for ${domain} from ${browser}`];
         if (result.failed > 0) msg.push(`(${result.failed} failed to decrypt)`);
         return msg.join(' ');
       }
 
-      // Picker UI mode — open in user's browser
+      if (hasAll) {
+        // Explicit all-cookies import — requires --all flag as a deliberate opt-in.
+        // Imports every non-expired cookie domain from the browser.
+        const browser = browserArg || 'comet';
+        const { listDomains } = await import('./cookie-import-browser');
+        const { domains } = listDomains(browser, profile);
+        const allDomainNames = domains.map((d: any) => d.domain);
+        if (allDomainNames.length === 0) {
+          return `No cookies found in ${browser} (profile: ${profile})`;
+        }
+        const result = await importCookies(browser, allDomainNames, profile);
+        if (result.cookies.length > 0) {
+          await page.context().addCookies(result.cookies);
+          bm.trackCookieImportDomains(allDomainNames);
+        }
+        const msg = [`Imported ${result.count} cookies across ${Object.keys(result.domainCounts).length} domains from ${browser}`];
+        msg.push('(used --all: all browser cookies imported, consider --domain for tighter scoping)');
+        if (result.failed > 0) msg.push(`(${result.failed} failed to decrypt)`);
+        return msg.join(' ');
+      }
+
+      // Picker UI mode — open in user's browser for interactive domain selection
       const port = bm.serverPort;
       if (!port) throw new Error('Server port not available');
 
@@ -554,11 +581,12 @@ export async function handleWriteCommand(
       const pickerUrl = `http://127.0.0.1:${port}/cookie-picker?code=${code}`;
       try {
         Bun.spawn(['open', pickerUrl], { stdout: 'ignore', stderr: 'ignore' });
-      } catch {
-        // open may fail silently — URL is in the message below
+      } catch (err: any) {
+        // open may fail on non-macOS or if 'open' binary is missing — URL is in the message below
+        if (err?.code !== 'ENOENT' && !err?.message?.includes('spawn')) throw err;
       }
 
-      return `Cookie picker opened at http://127.0.0.1:${port}/cookie-picker\nDetected browsers: ${browsers.map(b => b.name).join(', ')}\nSelect domains to import, then close the picker when done.`;
+      return `Cookie picker opened at http://127.0.0.1:${port}/cookie-picker\nDetected browsers: ${browsers.map(b => b.name).join(', ')}\nSelect domains to import, then close the picker when done.\n\nTip: For scripted imports, use --domain <domain> to scope cookies to a single domain.`;
     }
 
     case 'style': {
@@ -640,7 +668,10 @@ export async function handleWriteCommand(
                 (el as HTMLElement).style.setProperty('display', 'none', 'important');
                 removed++;
               });
-            } catch {}
+            } catch (err: any) {
+              // querySelectorAll throws DOMException on invalid CSS selectors — skip those
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
           return removed;
         }, selectors);
@@ -849,7 +880,9 @@ export async function handleWriteCommand(
               document.querySelectorAll(sel).forEach(el => {
                 (el as HTMLElement).style.display = 'none';
               });
-            } catch {}
+            } catch (err: any) {
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
           // Also hide fixed/sticky (except nav)
           for (const el of document.querySelectorAll('*')) {
@@ -872,7 +905,9 @@ export async function handleWriteCommand(
               document.querySelectorAll(sel).forEach(el => {
                 (el as HTMLElement).style.display = 'none';
               });
-            } catch {}
+            } catch (err: any) {
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
         }, hideSelectors);
       }
@@ -984,13 +1019,13 @@ export async function handleWriteCommand(
               reader.onerror = () => reject('Failed to read blob');
               reader.readAsDataURL(blob);
             });
-          } catch {
-            return 'ERROR:EXPIRED';
+          } catch (err: any) {
+            return `ERROR:EXPIRED:${err?.message || 'unknown'}`;
           }
         }, url);
 
         if (dataUrl === 'ERROR:TOO_LARGE') throw new Error('Blob too large (>100MB). Use a different approach.');
-        if (dataUrl === 'ERROR:EXPIRED') throw new Error('Blob URL expired or inaccessible.');
+        if (dataUrl.startsWith('ERROR:EXPIRED')) throw new Error(`Blob URL expired or inaccessible: ${dataUrl.slice('ERROR:EXPIRED:'.length)}`);
 
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) throw new Error('Failed to decode blob data');
